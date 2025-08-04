@@ -39,7 +39,12 @@ def args_parser():
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--bs", default=128, type=int)
     parser.add_argument("--epoch", default=200, type=int)
-
+    parser.add_argument("--eta_min", default=10, type=int)
+    parser.add_argument("--patience", default=10, type=int)
+    parser.add_argument("--metric", default='RMSD', type=str,choices=[ 'MAE',  'RMSD'])
+    #visulization
+    parser.add_argument("--smiles", default=None, type=str)
+    parser.add_argument("--get_image", default=False, type=bool)
     args = parser.parse_args()
 
     return args

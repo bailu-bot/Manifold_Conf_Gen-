@@ -2,13 +2,14 @@ import os
 import logging
 from tqdm import tqdm
 from munch import Munch, munchify
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.loader import DataLoader
 import numpy as np
-
+from rdkit import Chem
+from rdkit.Geometry import Point3D
 from GOOD import register
 from GOOD.utils.config_reader import load_config
 from GOOD.utils.metric import Metric
@@ -17,7 +18,7 @@ from GOOD.utils.evaluation import eval_data_preprocess, eval_score
 from GOOD.utils.train import nan2zero_get_mask
 import matplotlib.pyplot as plt
 from args_parse import args_parser
-from exputils import initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint
+from exputils import initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint,visualize_mol
 from models import GNNEncoder    
 from dataset import QM9Dataset
 from sklearn.manifold import TSNE
@@ -38,7 +39,26 @@ def set_requires_grad(nets, requires_grad=False):
                 param.requires_grad = requires_grad
 
 
-    
+class EarlyStopping:
+    def __init__(self, patience=10, lower_better=True):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = float('inf') if lower_better else -float('inf')
+        self.best_model = None
+        self.early_stop = False
+        self.lower_better = lower_better
+
+    def step(self, score, model):
+        improved = score < self.best_score if self.lower_better else score > self.best_score
+        if improved:
+            self.best_score = score
+            self.best_model = model.state_dict()
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
 class Runner:
     def __init__(self, args, writer, logger_path):
         self.args = args
@@ -54,16 +74,14 @@ class Runner:
         self.valid_loader = DataLoader(self.valid_set, batch_size=args.bs, shuffle=False)
         self.test_loader = DataLoader(self.test_set, batch_size=args.bs, shuffle=False)
         self.metric = Metric()
-        self.metric.set_loss_func(task_name='Binary classification')
-        self.metric.set_score_func(metric_name='ROC-AUC')
         cfg = Munch()
         cfg.metric = self.metric
-        cfg.model = Munch()
+        cfg.model = Munch() 
         cfg.model.model_level = 'graph'
-
+        self.early_stopper = EarlyStopping(patience=args.patience, lower_better=True)
         self.model = GNNEncoder(args=args, config=cfg).to(self.device)
         self.opt = torch.optim.Adam(self.model.parameters(), lr=args.lr)
-
+        self.scheduler = CosineAnnealingLR(self.opt, T_max=args.epoch, eta_min=args.eta_min)
         self.total_step = 0
         self.writer = writer
         describe_model(self.model, path=logger_path)
@@ -86,13 +104,19 @@ class Runner:
             self.train_step(e)
             valid_score = self.test_step(self.valid_loader)
             
-            logger.info(f"E={e}, valid={valid_score:.5f}, test-score={best_test_score:.5f}")
+            logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_score:.5f}, test-score={best_test_score:.5f}")
+            self.scheduler.step()
+            self.early_stopper.step(valid_score, self.model)
+            if self.early_stopper.early_stop:
+                logger.info("Early stopping triggered.")
+                self.model.load_state_dict(self.early_stopper.best_model)  # 恢复最佳模型
+                break
             # if valid_score > best_valid_score:
             if valid_score < best_valid_score :
                 test_score = self.test_step(self.test_loader)
                 best_valid_score = valid_score
                 best_test_score = test_score
-                logger.info(f"UPDATE test-score={best_test_score:.5f}")
+                logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
             if e % 10 == 0:
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
@@ -105,6 +129,23 @@ class Runner:
         for data in pbar:
             data = data.to(self.device)
             pred_pos,graph_feat, pos_loss, mani_loss = self.model(data)
+            if self.args.get_image==True:
+                for datapoint in data:
+                    if datapoint.smiles==self.args.smiles:
+                        mol=datapoint.rdmol
+                        conf = Chem.Conformer(mol.GetNumAtoms())
+                        for atom_idx, (x, y, z) in enumerate(pred_pos):
+                            conf.SetAtomPosition(atom_idx, Point3D(float(x), float(y), float(z)))
+                        mol.RemoveAllConformers()
+                        mol.AddConformer(conf, assignId=True)
+
+                        viewer = visualize_mol(mol, size=(400,400), surface=True, opacity=0.7)
+                        #viewer   ///in notebook will show 3D molecule that is interactive
+                        png_bytes = viewer.png()
+                        with open(f"mol_view_{datapoint.smiles}_{epoch}.png", "wb") as f:
+                            f.write(png_bytes)
+
+
 
 
             loss = pos_loss * self.args.pos_w + mani_loss * self.args.mani_w 
@@ -112,16 +153,17 @@ class Runner:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.opt.step()
-
-            pbar.set_postfix_str(f"loss={loss.item():.4f}","mani_loss={mani_loss.item():.4f}")
+            
+            pbar.set_postfix_str(f"loss={loss.item():.4f}, mani_loss={mani_loss.item():.4f}")
             self.writer.add_scalar('loss', loss.item(), self.total_step)
             self.writer.add_scalar('pos-loss', pos_loss.item(), self.total_step)
             self.writer.add_scalar('mani-loss', mani_loss.item(), self.total_step)
-
+            self.writer.add_scalar('lr', self.opt.param_groups[0]['lr'], epoch)
 
             self.total_step += 1
         # if epoch % 10 == 0 or epoch == self.args.epoch-1:
         #     self.visualize_aggregated_tsne(epoch)
+        
     @torch.no_grad()
     def test_step(self, loader):
         self.model.eval()
@@ -138,9 +180,12 @@ class Runner:
         # 把 list of tensors → tensor
         y_pred = torch.cat(y_pred, dim=0)  # shape: [total_atoms, 3]
         y_gt = torch.cat(y_gt, dim=0)      # same shape
-
-        score = F.mse_loss(y_pred, y_gt)
-
+        if self.args.metric == 'MAE':
+            score = F.l1_loss(y_pred, y_gt)
+        elif self.args.metric == 'RMSD':
+            score = torch.sqrt(F.mse_loss(y_pred, y_gt))
+        else:
+            raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD.")
         return score
 
 def main():
