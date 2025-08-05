@@ -23,7 +23,8 @@ from models import GNNEncoder
 from dataset import QM9Dataset
 from sklearn.manifold import TSNE
 logger = logging.getLogger()
-
+import pickle
+import copy
 
 def set_requires_grad(nets, requires_grad=False):
     """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
@@ -120,7 +121,7 @@ class Runner:
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
             if e % 10 == 0:
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
-        logger.info(f"test-score={best_test_score:.5f}")
+        logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']}")
 
     def train_step(self, epoch):
         self.model.train()
@@ -129,23 +130,54 @@ class Runner:
         for data in pbar:
             data = data.to(self.device)
             pred_pos,graph_feat, pos_loss, mani_loss = self.model(data)
+            #print(data.smiles)
             if self.args.get_image==True:
-                for datapoint in data:
-                    if datapoint.smiles==self.args.smiles:
-                        mol=datapoint.rdmol
+                for i, smiles in enumerate(data.smiles):
+                    if smiles==self.args.smiles:
+                        mol=data.rdmol[i]
+                        node_mask = (data.batch == i)            # bool tensor
+                        pos_i = pred_pos[node_mask]               # [num_atoms_i, 3]
+
+                        # 把预测坐标写回到 mol 上
                         conf = Chem.Conformer(mol.GetNumAtoms())
-                        for atom_idx, (x, y, z) in enumerate(pred_pos):
-                            conf.SetAtomPosition(atom_idx, Point3D(float(x), float(y), float(z)))
-                        mol.RemoveAllConformers()
+                        for atom_idx, (x, y, z) in enumerate(pos_i.tolist()):
+                            conf.SetAtomPosition(atom_idx, Point3D(x, y, z))
+
                         mol.AddConformer(conf, assignId=True)
+            
+        if epoch==self.args.epoch-1:
+            saved=False
+            for data in pbar:
+                data = data.to(self.device)
+                for i, smiles in enumerate(data.smiles):
+                    if smiles==self.args.smiles and saved==False:
+                        mol_gt = copy.deepcopy(mol)       
+                        mol_gt.RemoveAllConformers()      # 先清空它身上的所有 conformer
 
-                        viewer = visualize_mol(mol, size=(400,400), surface=True, opacity=0.7)
-                        #viewer   ///in notebook will show 3D molecule that is interactive
-                        png_bytes = viewer.png()
-                        with open(f"mol_view_{datapoint.smiles}_{epoch}.png", "wb") as f:
-                            f.write(png_bytes)
+                        # 从 data.pos 中取出 ground-truth 的那张图的所有原子位置
+                        node_mask = (data.batch == i)
+                        pos_gt = data.pos[node_mask]      # tensor [num_atoms,3]
 
+                        # 新建一个 conformer 并填坐标
+                        conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
+                        for atom_idx, (x, y, z) in enumerate(pos_gt.tolist()):
+                            conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
+                        mol_gt.AddConformer(conf_gt, assignId=True)
 
+                        output_dir = f"rdmol/{smiles}"
+                        os.makedirs(output_dir, exist_ok=True)   
+                        file_path_gt = os.path.join(output_dir, f"mol_view_{smiles}_gt.pkl")
+                        file_path = os.path.join(output_dir, f"mol_view_{smiles}.pkl")
+                        with open(file_path, "wb") as f:
+                            pickle.dump(mol, f)
+                        with open(file_path_gt, "wb") as f:
+                            pickle.dump(mol_gt, f)
+                        print("successfully saved mol view to", output_dir)
+                        saved = True
+                        break
+                if saved==True:
+                    break
+                        
 
 
             loss = pos_loss * self.args.pos_w + mani_loss * self.args.mani_w 
