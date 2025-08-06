@@ -10,12 +10,6 @@ from torch_geometric.loader import DataLoader
 import numpy as np
 from rdkit import Chem
 from rdkit.Geometry import Point3D
-from GOOD import register
-from GOOD.utils.config_reader import load_config
-from GOOD.utils.metric import Metric
-from GOOD.data.dataset_manager import read_meta_info
-from GOOD.utils.evaluation import eval_data_preprocess, eval_score
-from GOOD.utils.train import nan2zero_get_mask
 import matplotlib.pyplot as plt
 from args_parse import args_parser
 from exputils import initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint,visualize_mol
@@ -25,6 +19,8 @@ from sklearn.manifold import TSNE
 logger = logging.getLogger()
 import pickle
 import copy
+import json
+from datetime import datetime
 
 def set_requires_grad(nets, requires_grad=False):
     """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
@@ -74,9 +70,7 @@ class Runner:
         self.train_loader = DataLoader(self.train_set, batch_size=args.bs, shuffle=True, drop_last=True)
         self.valid_loader = DataLoader(self.valid_set, batch_size=args.bs, shuffle=False)
         self.test_loader = DataLoader(self.test_set, batch_size=args.bs, shuffle=False)
-        self.metric = Metric()
         cfg = Munch()
-        cfg.metric = self.metric
         cfg.model = Munch() 
         cfg.model.model_level = 'graph'
         self.early_stopper = EarlyStopping(patience=args.patience, lower_better=True)
@@ -91,9 +85,9 @@ class Runner:
 
     def run(self):
         if self.lower_better == 1:
-            best_valid_score, best_test_score = float('inf'), float('inf')
+            self.best_valid_score, best_test_score = float('inf'), float('inf')
         else:
-            best_valid_score, best_test_score = -1, -1
+            self.best_valid_score, best_test_score = -1, -1
         if self.args.checkpoint_path is not None:
             checkpoint = torch.load(self.args.checkpoint_path)
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -105,96 +99,99 @@ class Runner:
             self.train_step(e)
             valid_score = self.test_step(self.valid_loader)
             
-            logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_score:.5f}, test-score={best_test_score:.5f}")
-            self.scheduler.step()
-            self.early_stopper.step(valid_score, self.model)
-            if self.early_stopper.early_stop:
-                logger.info("Early stopping triggered.")
-                self.model.load_state_dict(self.early_stopper.best_model)  # 恢复最佳模型
-                break
-            # if valid_score > best_valid_score:
-            if valid_score < best_valid_score :
+            logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_score:.5f},test-score={best_test_score:.5f}")
+            logger.info(   f"lr={self.opt.param_groups[0]['lr']:.6f}")      
+            if self.args.early_stop==True:
+                self.early_stopper.step(valid_score, self.model)
+                if self.early_stopper.early_stop:
+                    logger.info("Early stopping triggered.")
+                    self.model.load_state_dict(self.early_stopper.best_model)  
+                    break
+            # if valid_score > self.best_valid_score:
+            if valid_score < self.best_valid_score :
                 test_score = self.test_step(self.test_loader)
-                best_valid_score = valid_score
+                self.best_valid_score = valid_score
                 best_test_score = test_score
                 logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
             if e % 10 == 0:
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
-        logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']}")
+        logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']:.6f}")
 
     def train_step(self, epoch):
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"E [{epoch}]")
-        self.all_c_features = []
+
+
+        found = False
+        mol_pred = None
+        pos_gt_data = None
+        smiles_target = self.args.smiles
+
+
         for data in pbar:
             data = data.to(self.device)
-            pred_pos,graph_feat, pos_loss, mani_loss = self.model(data)
-            #print(data.smiles)
-            if self.args.get_image==True:
+            pred_pos, graph_feat, pos_loss, mani_loss = self.model(data)
+
+            if self.args.get_image:
                 for i, smiles in enumerate(data.smiles):
-                    if smiles==self.args.smiles:
-                        mol=data.rdmol[i]
-                        node_mask = (data.batch == i)            # bool tensor
-                        pos_i = pred_pos[node_mask]               # [num_atoms_i, 3]
+                    if smiles == smiles_target and not found:
+           
+                        mol_pred = data.rdmol[i]
 
-                        # 把预测坐标写回到 mol 上
-                        conf = Chem.Conformer(mol.GetNumAtoms())
-                        for atom_idx, (x, y, z) in enumerate(pos_i.tolist()):
-                            conf.SetAtomPosition(atom_idx, Point3D(x, y, z))
-
-                        mol.AddConformer(conf, assignId=True)
-            
-        if epoch==self.args.epoch-1:
-            saved=False
-            for data in pbar:
-                data = data.to(self.device)
-                for i, smiles in enumerate(data.smiles):
-                    if smiles==self.args.smiles and saved==False:
-                        mol_gt = copy.deepcopy(mol)       
-                        mol_gt.RemoveAllConformers()      # 先清空它身上的所有 conformer
-
-                        # 从 data.pos 中取出 ground-truth 的那张图的所有原子位置
+                        conf = Chem.Conformer(mol_pred.GetNumAtoms())
                         node_mask = (data.batch == i)
-                        pos_gt = data.pos[node_mask]      # tensor [num_atoms,3]
+                        for atom_idx, (x, y, z) in enumerate(pred_pos[node_mask].tolist()):
+                            conf.SetAtomPosition(atom_idx, Point3D(x, y, z))
+                        mol_pred.AddConformer(conf, assignId=True)
 
-                        # 新建一个 conformer 并填坐标
-                        conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
-                        for atom_idx, (x, y, z) in enumerate(pos_gt.tolist()):
-                            conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
-                        mol_gt.AddConformer(conf_gt, assignId=True)
 
-                        output_dir = f"rdmol/{smiles}"
-                        os.makedirs(output_dir, exist_ok=True)   
-                        file_path_gt = os.path.join(output_dir, f"mol_view_{smiles}_gt.pkl")
-                        file_path = os.path.join(output_dir, f"mol_view_{smiles}.pkl")
-                        with open(file_path, "wb") as f:
-                            pickle.dump(mol, f)
-                        with open(file_path_gt, "wb") as f:
-                            pickle.dump(mol_gt, f)
-                        print("successfully saved mol view to", output_dir)
-                        saved = True
+                        pos_gt_data = data.pos[node_mask].cpu().numpy()
+                        found = True
                         break
-                if saved==True:
-                    break
-                        
 
-
-            loss = pos_loss * self.args.pos_w + mani_loss * self.args.mani_w 
+            loss = pos_loss * self.args.pos_w + mani_loss * self.args.mani_w
             self.opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.opt.step()
-            
+            self.scheduler.step()
             pbar.set_postfix_str(f"loss={loss.item():.4f}, mani_loss={mani_loss.item():.4f}")
             self.writer.add_scalar('loss', loss.item(), self.total_step)
             self.writer.add_scalar('pos-loss', pos_loss.item(), self.total_step)
             self.writer.add_scalar('mani-loss', mani_loss.item(), self.total_step)
             self.writer.add_scalar('lr', self.opt.param_groups[0]['lr'], epoch)
-
             self.total_step += 1
-        # if epoch % 10 == 0 or epoch == self.args.epoch-1:
-        #     self.visualize_aggregated_tsne(epoch)
+        # when the last epoch
+        if epoch == self.args.epoch  and found:
+            # generate mol_gt
+            mol_gt = copy.deepcopy(mol_pred)
+            mol_gt.RemoveAllConformers()
+            conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
+            for atom_idx, (x, y, z) in enumerate(pos_gt_data.tolist()):
+                conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
+            mol_gt.AddConformer(conf_gt, assignId=True)
+
+            # make output dir
+            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
+            safe_name = smiles_target.replace('/', '-').replace('[','').replace(']','').replace('@','')
+            output_dir = f"rdmol/{now_str}_{safe_name}"
+            os.makedirs(output_dir, exist_ok=True)
+
+            # save mol and .pdb files
+            with open(os.path.join(output_dir, "mol_view.pkl"), "wb") as f:
+                pickle.dump(mol_pred, f)
+            with open(os.path.join(output_dir, "mol_view_gt.pkl"), "wb") as f:
+                pickle.dump(mol_gt, f)
+            Chem.MolToPDBFile(mol_pred, os.path.join(output_dir, "mol_view.pdb"))
+            Chem.MolToPDBFile(mol_gt, os.path.join(output_dir, "mol_view_gt.pdb"))
+
+            # save args
+            with open(os.path.join(output_dir, "train_args.json"), "w") as f:
+                json.dump(vars(self.args), f, indent=4)
+            print("✅ Saved mol view and args to", output_dir)
+            # if epoch % 10 == 0 or epoch == self.args.epoch-1:
+            #     self.visualize_aggregated_tsne(epoch)
         
     @torch.no_grad()
     def test_step(self, loader):
@@ -220,10 +217,16 @@ class Runner:
             raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD.")
         return score
 
-def main():
-    args = args_parser()
+def main(args=None):
+    if args is None:
+        args = args_parser()
+    
     torch.cuda.set_device(int(args.gpu))
-
+    
+    # if bayesian optimization is enabled, return without running the main code
+    if hasattr(args, 'run_bayesian_optimization') and args.run_bayesian_optimization:
+        return
+    
     logger = initialize_exp(args)
     set_seed(args.random_seed)
     logger_path = get_dump_path(args)
@@ -232,7 +235,6 @@ def main():
     runner = Runner(args, writer, logger_path)
     runner.run()
     writer.close()
-
 
 if __name__ == '__main__':
     main()
