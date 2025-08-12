@@ -12,8 +12,8 @@ from rdkit import Chem
 from rdkit.Geometry import Point3D
 import matplotlib.pyplot as plt
 from args_parse import args_parser
-from exputils import mae_per_atom,initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint,visualize_mol,kabsch_alignment
-from models import GNNEncoder,resolve_internal_clashes_batch  
+from exputils import mae_per_atom, initialize_exp, set_seed, get_dump_path, describe_model, save_checkpoint, load_checkpoint, visualize_mol, kabsch_alignment
+from models import GNNEncoder, resolve_internal_clashes_batch
 from dataset import QM9Dataset
 from sklearn.manifold import TSNE
 logger = logging.getLogger()
@@ -21,6 +21,8 @@ import pickle
 import copy
 import json
 from datetime import datetime
+import time
+import optuna
 
 def set_requires_grad(nets, requires_grad=False):
     """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
@@ -70,7 +72,7 @@ class Runner:
         self.valid_loader = DataLoader(self.valid_set, batch_size=args.bs, shuffle=False)
         self.test_loader = DataLoader(self.test_set, batch_size=args.bs, shuffle=False)
         cfg = Munch()
-        cfg.model = Munch() 
+        cfg.model = Munch()
         cfg.model.model_level = 'graph'
         self.early_stopper = EarlyStopping(patience=args.patience, lower_better=True)
         self.model = GNNEncoder(args=args, config=cfg).to(self.device)
@@ -82,66 +84,150 @@ class Runner:
         self.logger_path = logger_path
         self.cfg = cfg
 
-    def run(self):
+    def run(self, optuna_trial=None):
+        """
+        运行训练流程。接收可选的 optuna_trial 用于上报与剪枝。
+        返回 best_valid_score (float)。
+        """
         if self.lower_better == 1:
-            self.best_valid_score, best_test_score = float('inf'), float('inf')
+            best_valid_score, best_test_score = float('inf'), float('inf')
         else:
-            self.best_valid_score, best_test_score = -1, -1
-        if self.args.checkpoint_path is not None:
-            checkpoint = torch.load(self.args.checkpoint_path)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.opt.load_state_dict(checkpoint['optimizer_state_dict'])
-            epoch = checkpoint['epoch']
-            best_test_score = checkpoint['best_test_score']
-            print("use previous checkpoint", "epoch is",epoch, "best_test_score is", best_test_score)
-        for e in range(self.args.epoch):
-            self.train_step(e)
-            valid_score = self.test_step(self.valid_loader)
-            metric_name = f"valid_{self.args.metric.lower()}"
-            self.writer.add_scalar(metric_name, valid_score.item(), e)
-            logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_score:.5f},test-score={best_test_score:.5f}")
-            logger.info(   f"lr={self.opt.param_groups[0]['lr']:.6f}")      
-            if self.args.early_stop==True:
-                self.early_stopper.step(valid_score, self.model)
-                if self.early_stopper.early_stop:
-                    logger.info("Early stopping triggered.")
-                    self.model.load_state_dict(self.early_stopper.best_model)
-                    mol_gt = copy.deepcopy(mol_pred)
-                    mol_gt.RemoveAllConformers()
-                    conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
-                    for atom_idx, (x, y, z) in enumerate(pos_gt_data.tolist()):
-                        conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
-                    mol_gt.AddConformer(conf_gt, assignId=True)
+            best_valid_score, best_test_score = -1, -1
 
-                    # make output dir
-                    
-                    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
-                    output_dir = f"rdmol/{now_str}_{smiles_target}"
-                    os.makedirs(output_dir, exist_ok=True)
+        try:
+            if self.args.checkpoint_path is not None:
+                checkpoint = torch.load(self.args.checkpoint_path)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.opt.load_state_dict(checkpoint['optimizer_state_dict'])
+                epoch = checkpoint['epoch']
+                best_test_score = checkpoint['best_test_score']
+                print("use previous checkpoint", "epoch is", epoch, "best_test_score is", best_test_score)
 
-                    # save mol and .pdb files
-                    with open(os.path.join(output_dir, "mol_view.pkl"), "wb") as f:
-                        pickle.dump(mol_pred, f)
-                    with open(os.path.join(output_dir, "mol_view_gt.pkl"), "wb") as f:
-                        pickle.dump(mol_gt, f)
-                    Chem.MolToPDBFile(mol_pred, os.path.join(output_dir, "mol_view.pdb"))
-                    Chem.MolToPDBFile(mol_gt, os.path.join(output_dir, "mol_view_gt.pdb"))
+            for e in range(self.args.epoch):
+                # 训练一步
+                self.train_step(e)
 
-  
-                    break
-            # if valid_score > self.best_valid_score:
-            if valid_score < self.best_valid_score :
-                test_score = self.test_step(self.test_loader)
-                self.best_valid_score = valid_score
-                best_test_score = test_score
+                # 验证
+                valid_score = self.test_step(self.valid_loader)
+                # 把可能的 tensor 转成 float
+                try:
+                    valid_val = float(valid_score)
+                except:
+                    try:
+                        valid_val = float(valid_score.item())
+                    except:
+                        valid_val = float('inf')
 
-                logger.info(f"best_valid_score = {self.best_valid_score:.6f}")
-                logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
-                save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
-            if e % 10 == 0:
-                save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
+                metric_name = f"valid_{self.args.metric.lower()}"
+                # writer expects scalar numbers
+                self.writer.add_scalar(metric_name, valid_val, e)
+                logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_val:.5f},test-score={best_test_score:.5f}")
+                logger.info(f"lr={self.opt.param_groups[0]['lr']:.6f}")
 
-        logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']:.6f}")
+                # early stopping
+                if self.args.early_stop==True:
+                    self.early_stopper.step(valid_val, self.model)
+                    if self.early_stopper.early_stop:
+                        logger.info("Early stopping triggered.")
+                        # restore best model
+                        self.model.load_state_dict(self.early_stopper.best_model)
+                        # Save conformer and outputs if possible (preserve original behavior if variables exist)
+                        try:
+                            mol_gt = copy.deepcopy(mol_pred)
+                            mol_gt.RemoveAllConformers()
+                            conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
+                            for atom_idx, (x, y, z) in enumerate(pos_gt_data.tolist()):
+                                conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
+                            mol_gt.AddConformer(conf_gt, assignId=True)
+
+                            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
+                            output_dir = f"rdmol/{now_str}_{smiles_target}"
+                            os.makedirs(output_dir, exist_ok=True)
+
+                            with open(os.path.join(output_dir, "mol_view.pkl"), "wb") as f:
+                                pickle.dump(mol_pred, f)
+                            with open(os.path.join(output_dir, "mol_view_gt.pkl"), "wb") as f:
+                                pickle.dump(mol_gt, f)
+                            Chem.MolToPDBFile(mol_pred, os.path.join(output_dir, "mol_view.pdb"))
+                            Chem.MolToPDBFile(mol_gt, os.path.join(output_dir, "mol_view_gt.pdb"))
+                        except Exception:
+                            # 如果上下文里没有这些变量则忽略（保守处理）
+                            pass
+
+                        break
+
+                # 更新最佳并保存 checkpoint
+                if valid_val < best_valid_score:
+                    test_score = self.test_step(self.test_loader)
+                    try:
+                        test_val = float(test_score)
+                    except:
+                        try:
+                            test_val = float(test_score.item())
+                        except:
+                            test_val = float('inf')
+                    best_valid_score = valid_val
+                    best_test_score = test_val
+
+                    logger.info(f"best_valid_score = {best_valid_score:.6f}")
+                    logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
+                    save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
+
+                if e % 10 == 0:
+                    save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
+
+                # 如果传入 optuna trial，则上报进度并检查是否需要剪枝
+                if optuna_trial is not None:
+                    try:
+                        optuna_trial.report(best_valid_score, e)
+                        if optuna_trial.should_prune():
+                            # 在剪枝前写入 metrics.json（原子写）
+                            metrics = {
+                                "status": "pruned",
+                                "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
+                                "best_epoch": None,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), metrics)
+                            raise optuna.exceptions.TrialPruned()
+                    except optuna.exceptions.TrialPruned:
+                        # 继续向上抛
+                        raise
+                    except Exception:
+                        # 如果上报失败，不阻断训练
+                        pass
+
+            logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']:.6f}")
+
+            # 训练正常结束：写 final metrics（原子写）
+            final_metrics = {
+                "status": "finished",
+                "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
+                "best_test_score": best_test_score if best_test_score != float('inf') else None,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), final_metrics)
+
+            return best_valid_score
+
+        except optuna.exceptions.TrialPruned:
+            logger.info("Trial was pruned by Optuna.")
+            raise
+        except Exception as e:
+            logger.exception("Exception during training")
+            # 尝试写 failed 状态的 metrics
+            err_metrics = {
+                "status": "failed",
+                "error": repr(e),
+                "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            try:
+                _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), err_metrics)
+            except Exception:
+                pass
+            # 重新抛出异常让外层处理
+            raise
 
     def train_step(self, epoch):
         self.model.train()
@@ -150,8 +236,8 @@ class Runner:
         mol_pred = None
         pos_gt_data = None
         smiles_target = self.args.smiles
-        total_loss_epoch = 0  
-        num_batches = 0       
+        total_loss_epoch = 0
+        num_batches = 0
 
         for data in pbar:
             data = data.to(self.device)
@@ -160,7 +246,7 @@ class Runner:
             if self.args.get_image:
                 for i, smiles in enumerate(data.smiles):
                     if smiles == smiles_target and not found:
-           
+
                         mol_pred = data.rdmol[i]
 
                         conf = Chem.Conformer(mol_pred.GetNumAtoms())
@@ -200,7 +286,7 @@ class Runner:
             mol_gt.AddConformer(conf_gt, assignId=True)
 
             # make output dir
-            
+
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
             output_dir = f"rdmol/{now_str}_{smiles_target}"
             os.makedirs(output_dir, exist_ok=True)
@@ -217,7 +303,7 @@ class Runner:
             with open(os.path.join(output_dir, "train_args.json"), "w") as f:
                 json.dump(vars(self.args), f, indent=4)
             print(" Saved mol view and args to", output_dir)
-    
+
 
         if self.args.get_image and found and (epoch % 10 == 0) and (epoch > self.last_conformer_save_epoch):
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
@@ -228,10 +314,9 @@ class Runner:
                 pickle.dump(mol_pred, f)
             Chem.MolToPDBFile(mol_pred, os.path.join(output_dir_mid, "mol_view_epoch.pdb"))
 
-
             self.last_conformer_save_epoch = epoch
             print(f"💾 Saved mid-training conformer at epoch {epoch} to {output_dir_mid}")
-     
+
     @torch.no_grad()
     def test_step(self, loader):
         self.model.eval()
@@ -250,7 +335,7 @@ class Runner:
         y_gt = torch.cat(y_gt, dim=0)      # same shape
         if self.args.metric == 'MAE':
             y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
-            score =mae_per_atom(y_pred, y_gt)
+            score = mae_per_atom(y_pred, y_gt)
         elif self.args.metric == 'RMSD':
             y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
             #score = torch.sqrt(F.mse_loss(y_pred, y_gt))
@@ -258,24 +343,43 @@ class Runner:
             raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD.")
         return score
 
-def main(args=None):
+def _atomic_write_json(path, obj):
+    """原子写 json：先写临时文件，再替换"""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=4)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, path)
+
+def main(args=None, optuna_trial=None):
     if args is None:
         args = args_parser()
-    
+
     torch.cuda.set_device(int(args.gpu))
-    
+
     # if bayesian optimization is enabled, return without running the main code
     if hasattr(args, 'run_bayesian_optimization') and args.run_bayesian_optimization:
         return
-    
+
     logger = initialize_exp(args)
     set_seed(args.random_seed)
     logger_path = get_dump_path(args)
     writer = SummaryWriter(log_dir=os.path.join(logger_path, 'tensorboard'))
 
     runner = Runner(args, writer, logger_path)
-    runner.run()
-    writer.close()
+    try:
+        best_score = runner.run(optuna_trial=optuna_trial)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    return best_score
 
 if __name__ == '__main__':
     main()
