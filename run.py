@@ -12,8 +12,8 @@ from rdkit import Chem
 from rdkit.Geometry import Point3D
 import matplotlib.pyplot as plt
 from args_parse import args_parser
-from exputils import initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint,visualize_mol
-from models import GNNEncoder    
+from exputils import mae_per_atom,initialize_exp, set_seed, get_dump_path, describe_model ,save_checkpoint,load_checkpoint,visualize_mol,kabsch_alignment
+from models import GNNEncoder,resolve_internal_clashes_batch  
 from dataset import QM9Dataset
 from sklearn.manifold import TSNE
 logger = logging.getLogger()
@@ -58,10 +58,9 @@ class EarlyStopping:
 
 class Runner:
     def __init__(self, args, writer, logger_path):
+        self.last_conformer_save_epoch = 0
         self.args = args
         self.device = torch.device(f'cuda')
-        self.all_c_features = []
-        self.y_labels = []
         dataset = QM9Dataset(name=args.dataset, root=args.data_root)
         self.train_set = dataset[dataset.train_index]
         self.valid_set = dataset[dataset.valid_index]
@@ -98,36 +97,61 @@ class Runner:
         for e in range(self.args.epoch):
             self.train_step(e)
             valid_score = self.test_step(self.valid_loader)
-            
+            metric_name = f"valid_{self.args.metric.lower()}"
+            self.writer.add_scalar(metric_name, valid_score.item(), e)
             logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_score:.5f},test-score={best_test_score:.5f}")
             logger.info(   f"lr={self.opt.param_groups[0]['lr']:.6f}")      
             if self.args.early_stop==True:
                 self.early_stopper.step(valid_score, self.model)
                 if self.early_stopper.early_stop:
                     logger.info("Early stopping triggered.")
-                    self.model.load_state_dict(self.early_stopper.best_model)  
+                    self.model.load_state_dict(self.early_stopper.best_model)
+                    mol_gt = copy.deepcopy(mol_pred)
+                    mol_gt.RemoveAllConformers()
+                    conf_gt = Chem.Conformer(mol_gt.GetNumAtoms())
+                    for atom_idx, (x, y, z) in enumerate(pos_gt_data.tolist()):
+                        conf_gt.SetAtomPosition(atom_idx, Point3D(x, y, z))
+                    mol_gt.AddConformer(conf_gt, assignId=True)
+
+                    # make output dir
+                    
+                    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
+                    output_dir = f"rdmol/{now_str}_{smiles_target}"
+                    os.makedirs(output_dir, exist_ok=True)
+
+                    # save mol and .pdb files
+                    with open(os.path.join(output_dir, "mol_view.pkl"), "wb") as f:
+                        pickle.dump(mol_pred, f)
+                    with open(os.path.join(output_dir, "mol_view_gt.pkl"), "wb") as f:
+                        pickle.dump(mol_gt, f)
+                    Chem.MolToPDBFile(mol_pred, os.path.join(output_dir, "mol_view.pdb"))
+                    Chem.MolToPDBFile(mol_gt, os.path.join(output_dir, "mol_view_gt.pdb"))
+
+  
                     break
             # if valid_score > self.best_valid_score:
             if valid_score < self.best_valid_score :
                 test_score = self.test_step(self.test_loader)
                 self.best_valid_score = valid_score
                 best_test_score = test_score
+
+                logger.info(f"best_valid_score = {self.best_valid_score:.6f}")
                 logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
             if e % 10 == 0:
                 save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
+
         logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']:.6f}")
 
     def train_step(self, epoch):
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"E [{epoch}]")
-
-
         found = False
         mol_pred = None
         pos_gt_data = None
         smiles_target = self.args.smiles
-
+        total_loss_epoch = 0  
+        num_batches = 0       
 
         for data in pbar:
             data = data.to(self.device)
@@ -144,11 +168,10 @@ class Runner:
                         for atom_idx, (x, y, z) in enumerate(pred_pos[node_mask].tolist()):
                             conf.SetAtomPosition(atom_idx, Point3D(x, y, z))
                         mol_pred.AddConformer(conf, assignId=True)
-
-
                         pos_gt_data = data.pos[node_mask].cpu().numpy()
                         found = True
                         break
+
 
             loss = pos_loss * self.args.pos_w + mani_loss * self.args.mani_w
             self.opt.zero_grad()
@@ -161,9 +184,13 @@ class Runner:
             self.writer.add_scalar('pos-loss', pos_loss.item(), self.total_step)
             self.writer.add_scalar('mani-loss', mani_loss.item(), self.total_step)
             self.writer.add_scalar('lr', self.opt.param_groups[0]['lr'], epoch)
+            total_loss_epoch += loss.item()
+            num_batches += 1
             self.total_step += 1
+        avg_loss_epoch = total_loss_epoch / num_batches
+        self.writer.add_scalar('loss_per_epoch', avg_loss_epoch, epoch)
         # when the last epoch
-        if epoch == self.args.epoch  and found:
+        if epoch == self.args.epoch-1  and found:
             # generate mol_gt
             mol_gt = copy.deepcopy(mol_pred)
             mol_gt.RemoveAllConformers()
@@ -173,9 +200,9 @@ class Runner:
             mol_gt.AddConformer(conf_gt, assignId=True)
 
             # make output dir
+            
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
-            safe_name = smiles_target.replace('/', '-').replace('[','').replace(']','').replace('@','')
-            output_dir = f"rdmol/{now_str}_{safe_name}"
+            output_dir = f"rdmol/{now_str}_{smiles_target}"
             os.makedirs(output_dir, exist_ok=True)
 
             # save mol and .pdb files
@@ -189,10 +216,22 @@ class Runner:
             # save args
             with open(os.path.join(output_dir, "train_args.json"), "w") as f:
                 json.dump(vars(self.args), f, indent=4)
-            print("✅ Saved mol view and args to", output_dir)
-            # if epoch % 10 == 0 or epoch == self.args.epoch-1:
-            #     self.visualize_aggregated_tsne(epoch)
-        
+            print(" Saved mol view and args to", output_dir)
+    
+
+        if self.args.get_image and found and (epoch % 10 == 0) and (epoch > self.last_conformer_save_epoch):
+            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
+            output_dir_mid = f"rdmol/epoch{epoch}_{now_str}_{smiles_target}"
+            os.makedirs(output_dir_mid, exist_ok=True)
+
+            with open(os.path.join(output_dir_mid, "mol_view_epoch.pkl"), "wb") as f:
+                pickle.dump(mol_pred, f)
+            Chem.MolToPDBFile(mol_pred, os.path.join(output_dir_mid, "mol_view_epoch.pdb"))
+
+
+            self.last_conformer_save_epoch = epoch
+            print(f"💾 Saved mid-training conformer at epoch {epoch} to {output_dir_mid}")
+     
     @torch.no_grad()
     def test_step(self, loader):
         self.model.eval()
@@ -210,9 +249,11 @@ class Runner:
         y_pred = torch.cat(y_pred, dim=0)  # shape: [total_atoms, 3]
         y_gt = torch.cat(y_gt, dim=0)      # same shape
         if self.args.metric == 'MAE':
-            score = F.l1_loss(y_pred, y_gt)
+            y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
+            score =mae_per_atom(y_pred, y_gt)
         elif self.args.metric == 'RMSD':
-            score = torch.sqrt(F.mse_loss(y_pred, y_gt))
+            y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
+            #score = torch.sqrt(F.mse_loss(y_pred, y_gt))
         else:
             raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD.")
         return score

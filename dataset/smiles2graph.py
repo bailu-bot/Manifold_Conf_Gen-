@@ -4,14 +4,13 @@ import rdkit
 import torch
 from rdkit import Chem
 
-
 def get_atom_features(atom):
     # The usage of features is along with the Attentive FP.
     feature = np.zeros(39)
 
     # Symbol
     symbol = atom.GetSymbol()
-    symbol_list = ['B', 'C', 'N', 'O', 'F', 'Si', 'P', 'S', 'Cl', 'As', 'Se', 'Br', 'H', 'I', 'At']
+    symbol_list = ['H','B', 'C', 'N', 'O', 'F', 'Si', 'P', 'S', 'Cl', 'As', 'Se', 'Br',  'I', 'At']
     if symbol in symbol_list:
         loc = symbol_list.index(symbol)
         feature[loc] = 1
@@ -111,6 +110,17 @@ def get_bond_features(bond):
 
     return feature
 
+def get_atom_vdw_radii(mol):
+    """计算每个原子的范德华半径"""
+    periodic_table = rdkit.Chem.GetPeriodicTable()
+    vdw_radii = []
+    for atom in mol.GetAtoms():
+        atomic_num = atom.GetAtomicNum()
+        # 获取范德华半径 (单位: Angstrom)
+        radius = periodic_table.GetRvdw(atomic_num)
+        vdw_radii.append(radius)
+    return torch.tensor(vdw_radii, dtype=torch.float).view(-1, 1)
+
 
 def smile2graph4GEOM(data):
     mol = data['rdmol']
@@ -126,7 +136,7 @@ def smile2graph4GEOM(data):
         atom_feature.append(one_atom_feature)
     atom_feature = np.array(atom_feature)
     atom_feature = torch.tensor(atom_feature).float()
-
+    vdw_radii = get_atom_vdw_radii(mol)
     if len(mol.GetBonds()) > 0:  # mol has bonds
         for bond in mol.GetBonds():
             i = bond.GetBeginAtomIdx()
@@ -151,6 +161,6 @@ def smile2graph4GEOM(data):
         edge_index = torch.empty((2, 0)).long()
         bond_feature = torch.empty((0, 10)).float()
 
-    return atom_feature, edge_index, bond_feature
+    return atom_feature, edge_index, bond_feature, vdw_radii
 
 
