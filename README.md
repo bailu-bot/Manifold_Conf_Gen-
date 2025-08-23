@@ -5,7 +5,7 @@ Research on Accurate Molecular 3D Conformation Generation Based on Supervised Ma
 ![Manifold Optimization](./test/optimization.gif)
 
 
-从**流形学习**角度把构象生成写成“**两张概率图的 CE 对齐来更新 Y**”本质上是把问题表述为：**把化学表征流形（高维）通过概率图 $P$／老师图 $Q^\*$ 与欧氏三维流形（坐标 $Y\in\mathbb{R}^3$）做**概率-几何**的**流形对齐（manifold alignment）**。这条线与“等变 GNN/扩散”“距离几何 + 能量”都不一样，能形成清晰的方法学贡献。
+从**流形学习**角度把构象生成写成“**两张概率图的 CE 对齐来更新 Y**”本质上是把问题表述为：**把化学表征流形（高维）通过概率图 $P$／老师图 $Q^\*$ 与欧氏三维流形（坐标 $Y\in\mathbb{R}^3$）做**概率-几何**的**流形对齐（manifold alignment）。这条线与“等变 GNN/扩散”“距离几何 + 能量”都不一样，能形成清晰的方法学贡献。
 
 ---
 
@@ -14,7 +14,7 @@ Research on Accurate Molecular 3D Conformation Generation Based on Supervised Ma
 我们不直接最小化坐标误差或能量，而是最小化**图上的交叉熵**：
 
 $$
-\min_Y\;\mathrm{CE}\big(T,\;Q(Y)\big),\qquad 
+\min_Y\;\mathrm{CE}\big(P,\;Q(Y)\big),\qquad 
 Q_{ij}(Y)=\frac{1}{1+a\,\lVert y_i-y_j\rVert^{2b}}
 $$
 
