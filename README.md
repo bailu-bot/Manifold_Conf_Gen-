@@ -4,6 +4,11 @@ Research on Accurate Molecular 3D Conformation Generation Based on Supervised Ma
 ## Unsupervised Optimization
 ![Manifold Optimization](./test/optimization.gif)
 
+## Unsupervised Optimization (High-dim graph by Y true)
+![Manifold Optimization](./test/Test_HighGraphFromY/optimization.gif)
+
+
+
 
 从**流形学习**角度把构象生成写成“**两张概率图的 CE 对齐来更新 Y**”本质上是把问题表述为：**把化学表征流形（高维）通过概率图 $P$／老师图 $Q^\*$ 与欧氏三维流形（坐标 $Y\in\mathbb{R}^3$）做**概率-几何**的**流形对齐（manifold alignment）。这条线与“等变 GNN/扩散”“距离几何 + 能量”都不一样，能形成清晰的方法学贡献。
 
