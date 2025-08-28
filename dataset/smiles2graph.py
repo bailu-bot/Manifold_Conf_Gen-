@@ -3,6 +3,14 @@ import numpy as np
 import rdkit
 import torch
 from rdkit import Chem
+import os
+from rdkit.Chem import AllChem
+from models import (
+    KERNEL, UMAPLowKernel, GaussianKernel, StudentTKernel, pairwise_dist,
+    UMAPRowExpKernel, UMAPRowFamilyKernel, SmoothKRowExpKernel, find_ab_params,
+)
+from models import KERNEL, pairwise_dist  
+
 
 def get_atom_features(atom):
     # The usage of features is along with the Attentive FP.
@@ -164,3 +172,39 @@ def smile2graph4GEOM(data):
     return atom_feature, edge_index, bond_feature, vdw_radii
 
 
+def teacher_coords_from_smiles(mol, seed=42, optimize=True):
+    """
+    用 RDKit ETKDG 生成 3D 坐标（仅重原子，保持与你可视化的原子顺序一致）。
+    如果优化=True，做一次 UFF 优化以稳定键长。
+    """
+    #mol = Chem.AddHs(mol)  # ETKDG 更稳
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    params.useSmallRingTorsions = True
+    ok = AllChem.EmbedMolecule(mol, params)
+    if ok != 0:
+        print("ETKDG embedding failed.")
+        return None, None
+    if optimize:
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=1000)
+        except Exception:
+            pass
+    conf = mol.GetConformer(0)
+    idx_map = [conf.GetAtomPosition(a.GetIdx()) for a in mol.GetAtoms()]
+    Y_true = np.array([[p.x, p.y, p.z] for p in idx_map], dtype=float)
+    return mol, Y_true
+
+def center_and_rescale(Y, target_rms=1.0):
+    """每个 epoch：居中并把坐标 RMS 缩放到 target_rms，防止数值漂移或坍缩。"""
+    Y = Y - Y.mean(axis=0, keepdims=True)
+    rms = np.sqrt((Y**2).mean())
+    if rms < 1e-8:
+        return Y
+    return Y * (target_rms / rms)
+
+def q_from_Y(Y: np.ndarray, KERNEL):
+    
+    D = pairwise_dist(Y)
+    Q = KERNEL.forward(D)
+    return Q, D

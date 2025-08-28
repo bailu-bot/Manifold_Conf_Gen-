@@ -12,9 +12,9 @@ from rdkit import Chem
 from rdkit.Geometry import Point3D
 import matplotlib.pyplot as plt
 from args_parse import args_parser
-from exputils import mae_per_atom, initialize_exp, set_seed, get_dump_path, describe_model, save_checkpoint, load_checkpoint, visualize_mol, kabsch_alignment
-from models import GNNEncoder, resolve_internal_clashes_batch
+from exputils import get_best_rmsd, mae_per_atom, initialize_exp, set_seed, get_dump_path, describe_model, save_checkpoint, load_checkpoint, visualize_mol, kabsch_alignment, merge_args_from_paths
 from dataset import QM9Dataset
+from models import GNNEncoder#,EGNNEncoder
 from sklearn.manifold import TSNE
 logger = logging.getLogger()
 import pickle
@@ -23,20 +23,15 @@ import json
 from datetime import datetime
 import time
 import optuna
+#from align3D_score import score_alignment
 
 def set_requires_grad(nets, requires_grad=False):
-    """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
-    Parameters:
-        nets (network list)   -- a list of networks
-        requires_grad (bool)  -- whether the networks require gradients or not
-    """
     if not isinstance(nets, list):
         nets = [nets]
     for net in nets:
         if net is not None:
             for param in net.parameters():
                 param.requires_grad = requires_grad
-
 
 class EarlyStopping:
     def __init__(self, patience=10, lower_better=True):
@@ -87,8 +82,11 @@ class Runner:
     def run(self, optuna_trial=None):
         """
         运行训练流程。接收可选的 optuna_trial 用于上报与剪枝。
-        返回 best_valid_score (float)。
+        返回 (best_valid_score, best_epoch) 元组（正常结束时）。
+        剪枝时抛出 optuna.exceptions.TrialPruned。
+        其他异常会继续抛出。
         """
+        best_epoch = None
         if self.lower_better == 1:
             best_valid_score, best_test_score = float('inf'), float('inf')
         else:
@@ -100,16 +98,15 @@ class Runner:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.opt.load_state_dict(checkpoint['optimizer_state_dict'])
                 epoch = checkpoint['epoch']
-                best_test_score = checkpoint['best_test_score']
+                best_test_score = checkpoint.get('best_test_score', best_test_score)
                 print("use previous checkpoint", "epoch is", epoch, "best_test_score is", best_test_score)
 
             for e in range(self.args.epoch):
-                # 训练一步
+                #train
                 self.train_step(e)
 
-                # 验证
+                # valid
                 valid_score = self.test_step(self.valid_loader)
-                # 把可能的 tensor 转成 float
                 try:
                     valid_val = float(valid_score)
                 except:
@@ -119,7 +116,6 @@ class Runner:
                         valid_val = float('inf')
 
                 metric_name = f"valid_{self.args.metric.lower()}"
-                # writer expects scalar numbers
                 self.writer.add_scalar(metric_name, valid_val, e)
                 logger.info(f"E={e}, Metrics:{self.args.metric},    valid={valid_val:.5f},test-score={best_test_score:.5f}")
                 logger.info(f"lr={self.opt.param_groups[0]['lr']:.6f}")
@@ -129,9 +125,7 @@ class Runner:
                     self.early_stopper.step(valid_val, self.model)
                     if self.early_stopper.early_stop:
                         logger.info("Early stopping triggered.")
-                        # restore best model
                         self.model.load_state_dict(self.early_stopper.best_model)
-                        # Save conformer and outputs if possible (preserve original behavior if variables exist)
                         try:
                             mol_gt = copy.deepcopy(mol_pred)
                             mol_gt.RemoveAllConformers()
@@ -151,9 +145,7 @@ class Runner:
                             Chem.MolToPDBFile(mol_pred, os.path.join(output_dir, "mol_view.pdb"))
                             Chem.MolToPDBFile(mol_gt, os.path.join(output_dir, "mol_view_gt.pdb"))
                         except Exception:
-                            # 如果上下文里没有这些变量则忽略（保守处理）
                             pass
-
                         break
 
                 # 更新最佳并保存 checkpoint
@@ -168,65 +160,66 @@ class Runner:
                             test_val = float('inf')
                     best_valid_score = valid_val
                     best_test_score = test_val
+                    best_epoch = e  # 记录最佳发生的 epoch
 
-                    logger.info(f"best_valid_score = {best_valid_score:.6f}")
+                    logger.info(f"best_valid_score = {best_valid_score:.6f} (epoch {best_epoch})")
                     logger.info(f"Metrics:{self.args.metric},  UPDATE test-score={best_test_score:.5f}")
                     save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, 'best.pth'))
 
                 if e % 10 == 0:
                     save_checkpoint(self.model, self.opt, e, best_test_score, os.path.join(self.logger_path, f'epoch{e}.pth'))
 
-                # 如果传入 optuna trial，则上报进度并检查是否需要剪枝
+                # 上报给 optuna 并检查剪枝
                 if optuna_trial is not None:
                     try:
-                        optuna_trial.report(best_valid_score, e)
+                        optuna_trial.report(best_valid_score if best_valid_score != float('inf') else None, e)
                         if optuna_trial.should_prune():
-                            # 在剪枝前写入 metrics.json（原子写）
                             metrics = {
                                 "status": "pruned",
                                 "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
-                                "best_epoch": None,
+                                "best_test_score": best_test_score if best_test_score != float('inf') else None,
+                                "best_epoch": best_epoch,
                                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             }
                             _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), metrics)
                             raise optuna.exceptions.TrialPruned()
                     except optuna.exceptions.TrialPruned:
-                        # 继续向上抛
                         raise
                     except Exception:
-                        # 如果上报失败，不阻断训练
                         pass
 
             logger.info(f"test-score={best_test_score:.5f},learning rate={self.opt.param_groups[0]['lr']:.6f}")
 
-            # 训练正常结束：写 final metrics（原子写）
+            # 正常结束，写 final metrics 并返回 (best_valid_score, best_epoch)
             final_metrics = {
                 "status": "finished",
                 "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
                 "best_test_score": best_test_score if best_test_score != float('inf') else None,
+                "best_epoch": best_epoch,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), final_metrics)
 
-            return best_valid_score
+            return best_valid_score, best_epoch
 
         except optuna.exceptions.TrialPruned:
             logger.info("Trial was pruned by Optuna.")
+            # 在被剪枝时已经写过 metrics.json（上面逻辑有写），向上抛出以便 Optuna 处理
             raise
         except Exception as e:
             logger.exception("Exception during training")
-            # 尝试写 failed 状态的 metrics
             err_metrics = {
                 "status": "failed",
                 "error": repr(e),
                 "best_valid_score": best_valid_score if best_valid_score != float('inf') else None,
+                "best_test_score": best_test_score if best_test_score != float('inf') else None,
+                "best_epoch": best_epoch,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             try:
                 _atomic_write_json(os.path.join(self.logger_path, "metrics.json"), err_metrics)
             except Exception:
                 pass
-            # 重新抛出异常让外层处理
             raise
 
     def train_step(self, epoch):
@@ -241,7 +234,8 @@ class Runner:
 
         for data in pbar:
             data = data.to(self.device)
-            pred_pos, graph_feat, pos_loss, mani_loss = self.model(data)
+            
+            pred_pos, graph_feat, pos_loss, mani_loss,mol_list = self.model(data,epoch=epoch)
 
             if self.args.get_image:
                 for i, smiles in enumerate(data.smiles):
@@ -265,7 +259,7 @@ class Runner:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
             self.opt.step()
             self.scheduler.step()
-            pbar.set_postfix_str(f"loss={loss.item():.4f}, mani_loss={mani_loss.item():.4f}")
+            pbar.set_postfix_str(f"loss={loss.item():.4f}, mani_loss={mani_loss:.4f}")
             self.writer.add_scalar('loss', loss.item(), self.total_step)
             self.writer.add_scalar('pos-loss', pos_loss.item(), self.total_step)
             self.writer.add_scalar('mani-loss', mani_loss.item(), self.total_step)
@@ -321,30 +315,37 @@ class Runner:
     def test_step(self, loader):
         self.model.eval()
         y_pred, y_gt = [], []
-
         for data in loader:
             data = data.to(self.device)
 
-            pred_pos, _, _, _ = self.model(data)
-
-            y_pred.append(pred_pos)         # shape: [num_atoms, 3]
+            pred_pos, _, _, _,mol_list = self.model(data,epoch=1)
+            
+            '''y_pred.append(pred_pos)         # shape: [num_atoms, 3]
             y_gt.append(data.pos)           # ground truth positions
 
         # 把 list of tensors → tensor
         y_pred = torch.cat(y_pred, dim=0)  # shape: [total_atoms, 3]
-        y_gt = torch.cat(y_gt, dim=0)      # same shape
+        y_gt = torch.cat(y_gt, dim=0)      # same shape'''
+            y_pred.extend(mol_list)
+            y_gt.extend(data.rdmol)
         if self.args.metric == 'MAE':
             y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
             score = mae_per_atom(y_pred, y_gt)
         elif self.args.metric == 'RMSD':
-            y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
+            score_sum = 0
+            for i in range(len(y_pred)):
+                score = get_best_rmsd(y_pred[i], y_gt[i])
+                score_sum = score_sum + score
+            score = score_sum / len(y_pred)
+            #y_pred,_,_,score = kabsch_alignment(y_pred, y_gt)
             #score = torch.sqrt(F.mse_loss(y_pred, y_gt))
+        elif self.args.metric == 'score_alignment':
+            score=score_alignment(y_pred,y_gt)
         else:
-            raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD.")
+            raise ValueError(f"metric is {self.args.metric}. We need MAE or RMSD or score_alignment.")
         return score
 
 def _atomic_write_json(path, obj):
-    """原子写 json：先写临时文件，再替换"""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=4)
@@ -358,7 +359,11 @@ def _atomic_write_json(path, obj):
 def main(args=None, optuna_trial=None):
     if args is None:
         args = args_parser()
-
+    try:
+        args = merge_args_from_paths(args,attr_name="paras_path")
+    except Exception:
+        logger = logging.getLogger()
+        logger.exception("merge_args_from_paths 出错，继续使用原始 args。")
     torch.cuda.set_device(int(args.gpu))
 
     # if bayesian optimization is enabled, return without running the main code
@@ -372,14 +377,15 @@ def main(args=None, optuna_trial=None):
 
     runner = Runner(args, writer, logger_path)
     try:
-        best_score = runner.run(optuna_trial=optuna_trial)
+        result = runner.run(optuna_trial=optuna_trial)
     finally:
         try:
             writer.close()
         except Exception:
             pass
 
-    return best_score
+    # runner.run 返回 (best_valid_score, best_epoch) 或抛异常
+    return result
 
 if __name__ == '__main__':
     main()
