@@ -1,6 +1,9 @@
 # Manifold_Conf_Gen-
 Research on Accurate Molecular 3D Conformation Generation Based on Supervised Manifold Learning
 
+# VIP: 最后验证一下概率图P在GNN-based 分子活性，属性预测中的效果： with, without P on featurizer performance
+# 侧面体现一下空间表示的重要性。 加上P之后分子lantent的表示是否更加结构敏感（活性悬崖意识增强）？
+
 ## Unsupervised Optimization
 ![Manifold Optimization](./test/optimization.gif)
 
